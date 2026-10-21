@@ -65,24 +65,27 @@ def create_app(config: dict | None = None) -> Flask:
         bootstrap_admin()
 
     # ------------------------------------------------------------------ auth
-    def check_login(username: str, password: str):
-        row = db().execute("SELECT username, password_hash, role FROM users WHERE username = ?",
+    def check_login(username: str, password: str, any_status: bool = False):
+        row = db().execute("SELECT username, password_hash, role, status FROM users WHERE username = ?",
                            (username,)).fetchone()
         if not row or not check_password_hash(row["password_hash"], password or ""):
             return None
-        return {"username": row["username"], "role": row["role"]}
+        if row["status"] != "active" and not any_status:
+            return None
+        return {"username": row["username"], "role": row["role"], "status": row["status"]}
 
     def current_user():
-        # 1) browser session cookie (login form)  2) HTTP Basic (scripts, curl)
-        name = session.get("u")
-        if name:
-            row = db().execute("SELECT username, role FROM users WHERE username = ?", (name,)).fetchone()
-            if row:
-                return {"username": row["username"], "role": row["role"]}
-            session.clear()
+        # 1) explicit HTTP Basic header (scripts, curl)  2) browser session cookie (login form)
         auth = request.authorization
         if auth and auth.type == "basic" and auth.username:
             return check_login(auth.username, auth.password or "")
+        name = session.get("u")
+        if name:
+            row = db().execute("SELECT username, role FROM users WHERE username = ? AND status = 'active'",
+                               (name,)).fetchone()
+            if row:
+                return {"username": row["username"], "role": row["role"]}
+            session.clear()
         return None
 
     def require(level: str = "viewer"):
@@ -162,10 +165,14 @@ def create_app(config: dict | None = None) -> Flask:
         if len(recent) >= 10:
             return jsonify(error="rate_limited", message="Sai quá nhiều lần, thử lại sau 5 phút"), 429
         body = request.get_json(silent=True) or {}
-        user = check_login(str(body.get("username", "")).strip(), str(body.get("password", "")))
+        user = check_login(str(body.get("username", "")).strip(), str(body.get("password", "")), any_status=True)
         if not user:
             failed[ip] = recent + [now]
             return jsonify(error="invalid_credentials", message="Sai tên đăng nhập hoặc mật khẩu"), 401
+        if user["status"] == "pending":
+            return jsonify(error="pending", message="Tài khoản đang chờ admin duyệt và phân quyền"), 403
+        if user["status"] == "disabled":
+            return jsonify(error="disabled", message="Tài khoản đã bị khóa, liên hệ admin"), 403
         failed.pop(ip, None)
         session.clear()
         session.permanent = True
@@ -180,15 +187,85 @@ def create_app(config: dict | None = None) -> Flask:
     @app.get("/api/setup")
     def setup_state():
         has_users = bool(db().execute("SELECT 1 FROM users LIMIT 1").fetchone())
-        return jsonify(hasUsers=has_users)
+        return jsonify(hasUsers=has_users, needsToken=bool(os.environ.get("SETUP_TOKEN")))
+
+    @app.post("/api/setup")
+    def setup_first_admin():
+        """First run only: while there is no user at all, the first visitor creates the admin account.
+        Set SETUP_TOKEN to require a token for this step."""
+        if db().execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            return jsonify(error="already_setup", message="Đã có tài khoản, hãy đăng nhập"), 409
+        body = request.get_json(silent=True) or {}
+        token = os.environ.get("SETUP_TOKEN")
+        if token and body.get("token") != token:
+            return jsonify(error="invalid_token", message="Sai mã cài đặt (SETUP_TOKEN)"), 403
+        username, password = str(body.get("username", "")).strip(), str(body.get("password", ""))
+        if not NAME_RX.match(username):
+            return jsonify(error="invalid_username", message="Tên đăng nhập chỉ gồm chữ không dấu, số, . _ -"), 400
+        if len(password) < 8:
+            return jsonify(error="weak_password", message="Mật khẩu tối thiểu 8 ký tự"), 400
+        upsert_user(username, password, "admin")
+        session.clear()
+        session.permanent = True
+        session["u"] = username
+        return jsonify(username=username, role="admin"), 201
+
+    @app.post("/api/register")
+    def register():
+        """Sign-up form: the account waits ('pending') until an admin approves it and picks a role.
+        The very first account on an empty server becomes the active admin."""
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+        now = time.time()
+        recent = [t for t in failed.get("reg:" + ip, []) if now - t < 3600]
+        if len(recent) >= 5:
+            return jsonify(error="rate_limited", message="Đăng ký quá nhiều lần, thử lại sau"), 429
+        body = request.get_json(silent=True) or {}
+        username, password = str(body.get("username", "")).strip(), str(body.get("password", ""))
+        full_name = str(body.get("fullName", "")).strip()[:120]
+        if not NAME_RX.match(username):
+            return jsonify(error="invalid_username", message="Tên đăng nhập chỉ gồm chữ không dấu, số, . _ -"), 400
+        if len(password) < 8:
+            return jsonify(error="weak_password", message="Mật khẩu tối thiểu 8 ký tự"), 400
+        con = db()
+        if con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+            return jsonify(error="taken", message="Tên đăng nhập đã có người dùng"), 409
+        first = not con.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        token = os.environ.get("SETUP_TOKEN")
+        if first and token and body.get("token") != token:
+            return jsonify(error="invalid_token", message="Sai mã cài đặt (SETUP_TOKEN)"), 403
+        con.execute("INSERT INTO users (username, password_hash, role, status, full_name) VALUES (?,?,?,?,?)",
+                    (username, generate_password_hash(password), "admin" if first else "viewer",
+                     "active" if first else "pending", full_name or None))
+        con.commit()
+        failed["reg:" + ip] = recent + [now]
+        if first:
+            session.clear(); session.permanent = True; session["u"] = username
+            return jsonify(username=username, role="admin", status="active"), 201
+        return jsonify(username=username, status="pending",
+                       message="Đã gửi đăng ký. Chờ admin duyệt và phân quyền rồi đăng nhập."), 201
+
+    @app.post("/api/me/password")
+    @require("viewer")
+    def change_password():
+        body = request.get_json(silent=True) or {}
+        if not check_login(g.user["username"], str(body.get("current", ""))):
+            return jsonify(error="invalid_credentials", message="Mật khẩu hiện tại không đúng"), 403
+        new = str(body.get("password", ""))
+        if len(new) < 8:
+            return jsonify(error="weak_password", message="Mật khẩu tối thiểu 8 ký tự"), 400
+        upsert_user(g.user["username"], new, g.user["role"])
+        return jsonify(ok=True)
 
     # ----------------------------------------------------------------- api
     @app.get("/api/me")
     @require("viewer")
     def me():
         role = g.user["role"]
-        return jsonify(username=g.user["username"], role=role,
-                       canWrite=ROLES[role] >= ROLES["editor"], canEdit=role == "admin")
+        out = dict(username=g.user["username"], role=role,
+                   canWrite=ROLES[role] >= ROLES["editor"], canEdit=role == "admin")
+        if role == "admin":
+            out["pendingUsers"] = int(db().execute("SELECT COUNT(*) AS n FROM users WHERE status = 'pending'").fetchone()["n"])
+        return jsonify(out)
 
     @app.get("/api/collections/<collection>")
     @require("viewer")
@@ -356,7 +433,8 @@ def create_app(config: dict | None = None) -> Flask:
     @app.get("/api/users")
     @require("admin")
     def users_list():
-        rows = db().execute("SELECT username, role, created_at FROM users ORDER BY username").fetchall()
+        rows = db().execute("SELECT username, role, status, full_name, created_at FROM users "
+                            "ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, username").fetchall()
         return jsonify(users=[dict(r) for r in rows])
 
     @app.put("/api/users/<username>")
@@ -364,11 +442,46 @@ def create_app(config: dict | None = None) -> Flask:
     def users_put(username):
         check_name(username)
         body = request.get_json(silent=True) or {}
-        role, password = body.get("role", "viewer"), body.get("password")
+        exists = db().execute("SELECT role, status FROM users WHERE username = ?", (username,)).fetchone()
+        role = body.get("role") or (exists["role"] if exists else "viewer")
+        status = body.get("status") or (exists["status"] if exists else "active")
+        password = body.get("password") or None
         if role not in ROLES:
-            return jsonify(error="invalid role"), 400
+            return jsonify(error="invalid_role", message="Vai trò không hợp lệ"), 400
+        if status not in ("active", "pending", "disabled"):
+            return jsonify(error="invalid_status", message="Trạng thái không hợp lệ"), 400
+        if username == g.user["username"] and (status != "active" or role != "admin"):
+            return jsonify(error="self", message="Không thể tự hạ quyền hoặc khóa chính mình"), 400
+        if not exists and not password:
+            return jsonify(error="weak_password", message="Tài khoản mới cần mật khẩu"), 400
+        if password is not None and len(password) < 8:
+            return jsonify(error="weak_password", message="Mật khẩu tối thiểu 8 ký tự"), 400
+        if exists and exists["role"] == "admin" and exists["status"] == "active" \
+                and (role != "admin" or status != "active") and admin_count() <= 1:
+            return jsonify(error="last_admin", message="Phải còn ít nhất một admin"), 400
         upsert_user(username, password, role)
-        return jsonify(username=username, role=role)
+        con = db()
+        if "fullName" in body:
+            con.execute("UPDATE users SET full_name = ? WHERE username = ?", (str(body["fullName"])[:120] or None, username))
+        con.execute("UPDATE users SET status = ? WHERE username = ?", (status, username))
+        con.commit()
+        return jsonify(username=username, role=role, status=status), (200 if exists else 201)
+
+    @app.delete("/api/users/<username>")
+    @require("admin")
+    def users_delete(username):
+        check_name(username)
+        if username == g.user["username"]:
+            return jsonify(error="self", message="Không thể xóa chính mình"), 400
+        row = db().execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            return jsonify(error="not_found"), 404
+        if row["role"] == "admin" and admin_count() <= 1:
+            return jsonify(error="last_admin", message="Phải còn ít nhất một admin"), 400
+        con = db()
+        con.execute("DELETE FROM users WHERE username = ?", (username,))
+        con.commit()
+        return jsonify(deleted=True)
 
     @app.errorhandler(400)
     def bad_request(e):
@@ -422,6 +535,11 @@ def close_db(_exc=None) -> None:
 def init_db() -> None:
     con = db()
     con.executescript((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()}
+    if "status" not in cols:   # databases created by an earlier version
+        con.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    if "full_name" not in cols:
+        con.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
     con.commit()
 
 
@@ -444,13 +562,22 @@ def upsert_user(username: str, password: str | None, role: str) -> None:
     con.commit()
 
 
+def admin_count() -> int:
+    return int(db().execute("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND status = 'active'").fetchone()["n"])
+
+
 def bootstrap_admin() -> None:
-    """Create the first admin from ADMIN_USER / ADMIN_PASSWORD when no user exists yet."""
+    """Create accounts from the environment when no user exists yet:
+    ADMIN_USER / ADMIN_PASSWORD, and/or CRM_USERS="name:password:role,name2:password2:role2"."""
     if db().execute("SELECT 1 FROM users LIMIT 1").fetchone():
         return
     user, pw = os.environ.get("ADMIN_USER"), os.environ.get("ADMIN_PASSWORD")
     if user and pw:
         upsert_user(user, pw, "admin")
+    for item in filter(None, (x.strip() for x in os.environ.get("CRM_USERS", "").split(","))):
+        parts = item.split(":")
+        if len(parts) == 3 and parts[2] in ROLES and NAME_RX.match(parts[0]) and parts[1]:
+            upsert_user(parts[0], parts[1], parts[2])
 
 
 def import_data(payload: dict, by: str = "import") -> int:
