@@ -62,11 +62,11 @@ def test_login_rate_limit(client):
 
 
 def test_setup_state(client):
-    assert client.get("/api/setup").json == {"hasUsers": True}
+    assert client.get("/api/setup").json == {"hasUsers": True, "needsToken": False}
 
 
 def test_me_roles(client):
-    assert client.get("/api/me", headers=ADMIN).json == {"username": "admin", "role": "admin", "canWrite": True, "canEdit": True}
+    assert client.get("/api/me", headers=ADMIN).json == {"username": "admin", "role": "admin", "canWrite": True, "canEdit": True, "pendingUsers": 0}
     assert client.get("/api/me", headers=EDITOR).json["canEdit"] is False
     assert client.get("/api/me", headers=VIEWER).json["canWrite"] is False
 
@@ -151,9 +151,9 @@ def test_export_import_admin_only(client):
 
 
 def test_user_management(client):
-    assert client.put("/api/users/newbie", json={"password": "p", "role": "editor"}, headers=EDITOR).status_code == 403
-    assert client.put("/api/users/newbie", json={"password": "p", "role": "editor"}, headers=ADMIN).status_code == 200
-    assert client.get("/api/me", headers=auth("newbie", "p")).json["role"] == "editor"
+    assert client.put("/api/users/newbie", json={"password": "pass1234", "role": "editor"}, headers=EDITOR).status_code == 403
+    assert client.put("/api/users/newbie", json={"password": "pass1234", "role": "editor"}, headers=ADMIN).status_code == 201
+    assert client.get("/api/me", headers=auth("newbie", "pass1234")).json["role"] == "editor"
 
 
 def test_seed_file_imports(client, tmp_path):
@@ -171,3 +171,58 @@ def test_only_frontend_files_are_public(client):
     assert client.get("/static/claude-shim.js").status_code in (200, 404)
     for bad in ("/static/app.py", "/static/schema.sql", "/static/../app.py", "/app.py"):
         assert client.get(bad).status_code == 404
+
+
+def test_self_register_then_admin_approves(client):
+    r = client.post("/api/register", json={"username": "nv.ban", "password": "matkhau123", "fullName": "Nguyễn Văn Bán"})
+    assert r.status_code == 201 and r.json["status"] == "pending"
+    assert client.post("/api/register", json={"username": "nv.ban", "password": "matkhau123"}).status_code == 409
+    assert client.post("/api/register", json={"username": "x y", "password": "matkhau123"}).status_code == 400
+    assert client.post("/api/register", json={"username": "ngan", "password": "123"}).status_code == 400
+    # pending account cannot sign in yet
+    r = client.post("/api/login", json={"username": "nv.ban", "password": "matkhau123"})
+    assert r.status_code == 403 and r.json["error"] == "pending"
+    assert client.get("/api/me", headers=auth("nv.ban", "matkhau123")).status_code == 401
+    # admin sees it first in the list and approves it as a normal user (editor)
+    assert client.get("/api/me", headers=ADMIN).json["pendingUsers"] == 1
+    users = client.get("/api/users", headers=ADMIN).json["users"]
+    assert users[0]["username"] == "nv.ban" and users[0]["status"] == "pending" and users[0]["full_name"] == "Nguyễn Văn Bán"
+    assert client.put("/api/users/nv.ban", json={"status": "active", "role": "editor"}, headers=EDITOR).status_code == 403
+    assert client.put("/api/users/nv.ban", json={"status": "active", "role": "editor"}, headers=ADMIN).status_code == 200
+    assert client.post("/api/login", json={"username": "nv.ban", "password": "matkhau123"}).json["role"] == "editor"
+    # disabling blocks the open session too
+    client.put("/api/users/nv.ban", json={"status": "disabled"}, headers=ADMIN)
+    assert client.get("/api/me").status_code == 401
+
+
+def test_first_registration_becomes_admin(tmp_path):
+    app = crm.create_app({"DATABASE": str(tmp_path / "e.sqlite3"), "UPLOAD_DIR": str(tmp_path / "u"), "SECRET_KEY": "t"})
+    c = app.test_client()
+    assert c.get("/api/setup").json["hasUsers"] is False
+    r = c.post("/api/register", json={"username": "boss", "password": "matkhau123"})
+    assert r.status_code == 201 and r.json["role"] == "admin" and r.json["status"] == "active"
+    assert c.get("/api/me").json["role"] == "admin"
+    assert c.post("/api/register", json={"username": "nv2", "password": "matkhau123"}).json["status"] == "pending"
+
+
+def test_admin_guards(client):
+    assert client.put("/api/users/admin", json={"role": "viewer"}, headers=ADMIN).status_code == 400   # self
+    assert client.delete("/api/users/admin", headers=ADMIN).status_code == 400
+    assert client.delete("/api/users/sales", headers=ADMIN).json["deleted"] is True
+
+
+def test_change_password(client):
+    assert client.post("/api/me/password", json={"current": "x", "password": "newpass123"}, headers=EDITOR).status_code == 403
+    assert client.post("/api/me/password", json={"current": "s-secret", "password": "newpass123"}, headers=EDITOR).status_code == 200
+    assert client.get("/api/me", headers=auth("sales", "newpass123")).status_code == 200
+
+
+def test_old_database_is_migrated(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.sqlite3"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT)")
+    con.commit(); con.close()
+    crm.create_app({"DATABASE": str(path), "UPLOAD_DIR": str(tmp_path / "u"), "SECRET_KEY": "t"})
+    cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(users)")}
+    assert {"status", "full_name"} <= cols
