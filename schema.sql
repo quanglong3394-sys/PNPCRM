@@ -40,11 +40,15 @@ CREATE TABLE IF NOT EXISTS assets (
     created_by    TEXT
 );
 
--- Users. role: viewer (read only) < editor (enter data) < admin (everything,
+-- Users (self sign-up + admin approval). role: viewer (read only) < editor (enter data) < admin (everything,
 -- incl. moving volume between promotions and managing users).
 CREATE TABLE IF NOT EXISTS users (
     username       TEXT PRIMARY KEY,
     password_hash  TEXT NOT NULL,
     role           TEXT NOT NULL CHECK (role IN ('viewer','editor','admin')),
+    status         TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','pending','disabled')),
+    full_name      TEXT,
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- status: 'pending' = registered on the sign-up form, waiting for an admin to approve and pick a role;
+--         'active'  = can sign in;  'disabled' = blocked by an admin.
