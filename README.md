@@ -77,24 +77,37 @@ docker cp crm-data.json crm:/tmp/crm-data.json
 docker exec crm python app.py import /tmp/crm-data.json
 ```
 
-## Người dùng và phân quyền
+## Tài khoản: đăng ký, đăng nhập, phân quyền
+
+**Lần đầu mở trang** (máy chủ chưa có tài khoản nào): trang hiện màn hình **Cài đặt lần đầu**. Người đầu tiên tạo tài khoản sẽ là **admin**.
+- Muốn chắc chắn không ai chiếm trước: đặt biến `SETUP_TOKEN=<mã bí mật>`. Màn hình cài đặt sẽ hỏi mã này.
+- Hoặc tạo sẵn admin bằng `ADMIN_USER` / `ADMIN_PASSWORD`.
+
+**Người dùng tự đăng ký** ở tab **Đăng ký** trên khung đăng nhập, gồm họ tên, tên đăng nhập và mật khẩu ít nhất 8 ký tự. Tài khoản mới ở trạng thái **Chờ duyệt** và chưa đăng nhập được.
+
+**Admin duyệt và phân quyền** trong mục **Tài khoản** ở góc trái. Mục này hiện số tài khoản đang chờ duyệt.
+- Chọn vai trò cho từng tài khoản rồi bấm **Duyệt**.
+- Đổi vai trò hoặc trạng thái bất kỳ lúc nào: *Hoạt động* hoặc *Khóa*. Tài khoản bị khóa bị đăng xuất ngay.
+- Xóa tài khoản.
+- Tạo tài khoản trực tiếp, hoặc đặt lại mật khẩu cho người khác: nhập tên đã có kèm mật khẩu mới.
+- Admin không thể tự hạ quyền hay khóa chính mình. Hệ thống luôn giữ ít nhất một admin.
 
 | Vai trò | Được làm |
 |---|---|
-| `viewer` | xem mọi trang, tải file chứng từ. Các nút nhập/sửa bị ẩn |
-| `editor` | nhập liệu: khách hàng, báo cáo sản lượng, phiếu đăng ký, chứng từ, voucher, giá, SOW |
-| `admin` | như editor, thêm chuyển sản lượng giữa CTKM, sao lưu/nhập dữ liệu, quản lý người dùng |
+| `viewer` — Chỉ xem | xem mọi trang, tải file chứng từ. Các nút nhập/sửa bị ẩn |
+| `editor` — Người dùng (nhập liệu) | nhập liệu: khách hàng, báo cáo sản lượng, phiếu đăng ký, chứng từ, voucher, giá, SOW |
+| `admin` — Quản trị | như người dùng, thêm duyệt và phân quyền tài khoản, chuyển sản lượng giữa CTKM, sao lưu/nhập dữ liệu |
+
+Mỗi người tự đổi mật khẩu ở mục **Đổi mật khẩu**.
+
+Tạo tài khoản bằng lệnh vẫn được:
 
 ```bash
 python app.py create-user sales01 <mat-khau> editor
 python app.py create-user giamdoc <mat-khau> viewer
 ```
 
-Admin cũng tạo người dùng qua API: `PUT /api/users/<ten>` với `{"password": "...", "role": "editor"}`.
-
-Đăng nhập bằng khung đăng nhập của trang, lưu phiên bằng cookie, mặc định 14 ngày. Script và curl có thể dùng HTTP Basic: `curl -u admin:<mk> .../api/me`. Sai mật khẩu 10 lần trong 5 phút sẽ bị khóa tạm 5 phút.
-
-Trang chủ `/` và các đường kiểm tra sức khỏe `/healthz`, `/health`, `/ping` **không cần đăng nhập** và luôn trả 200, nên nền tảng triển khai kiểm tra được. Trang chủ chỉ là giao diện, không chứa dữ liệu. Mọi dữ liệu (`/api/...`) và file (`/_blob/...`) đều bắt buộc đăng nhập.
+Hoặc tạo sẵn nhiều tài khoản khi khởi động lần đầu: `CRM_USERS="sales01:matkhau1:editor,giamdoc:matkhau2:viewer"`.
 
 ## Biến môi trường
 
@@ -102,6 +115,8 @@ Trang chủ `/` và các đường kiểm tra sức khỏe `/healthz`, `/health`
 |---|---|---|
 | `DATA_DIR` | `./data` (Docker: `/data`) | nơi lưu cơ sở dữ liệu và file chứng từ. **Phải là ổ lưu trữ bền**, không bị xóa khi deploy lại |
 | `ADMIN_USER`, `ADMIN_PASSWORD` | — | tạo tài khoản admin đầu tiên khi chưa có người dùng nào |
+| `CRM_USERS` | — | tạo sẵn nhiều tài khoản lần đầu: `ten:matkhau:vaitro,...` |
+| `SETUP_TOKEN` | — | nếu đặt, màn hình cài đặt lần đầu phải nhập đúng mã này |
 | `SECRET_KEY` | tự sinh, lưu ở `DATA_DIR/.secret_key` | khóa ký cookie đăng nhập. Đặt cố định nếu chạy nhiều máy |
 | `COOKIE_SECURE` | `0` | đặt `1` khi chạy sau HTTPS để cookie chỉ gửi qua HTTPS |
 | `SESSION_DAYS` | `14` | số ngày giữ đăng nhập |
@@ -137,9 +152,13 @@ Khi đưa lên Internet **bắt buộc chạy sau HTTPS**, ví dụ nền tảng
 | DELETE | `/api/assets/<id>` | editor | xóa file |
 | GET | `/api/export` | admin | sao lưu toàn bộ dữ liệu (JSON) |
 | POST | `/api/import` | admin | nạp dữ liệu `{bst: [{id, ...}]}` |
-| GET / PUT | `/api/users`, `/api/users/<ten>` | admin | quản lý người dùng |
+| GET / PUT | `/api/users`, `/api/users/<ten>` | admin | danh sách; duyệt, đổi vai trò/trạng thái (`role`, `status`: active/pending/disabled), đặt lại mật khẩu |
 | GET | `/healthz`, `/health`, `/ping` | công khai | kiểm tra máy chủ còn chạy |
 | POST | `/api/login`, `/api/logout` | công khai | đăng nhập / đăng xuất (cookie) |
+| POST | `/api/register` | công khai | tự đăng ký (chờ admin duyệt; tài khoản đầu tiên thành admin) |
+| GET / POST | `/api/setup` | công khai | trạng thái / tạo admin lần đầu |
+| POST | `/api/me/password` | đã đăng nhập | đổi mật khẩu của mình |
+| DELETE | `/api/users/<ten>` | admin | xóa tài khoản |
 | GET | `/` | công khai | giao diện CRM (tự hiện khung đăng nhập) |
 
 Các bộ sưu tập giao diện đang dùng:
